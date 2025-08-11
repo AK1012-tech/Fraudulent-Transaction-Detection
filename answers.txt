@@ -1,0 +1,195 @@
+Pipeline details:
+
+### 1) Data cleaning (missing values, outliers, multicollinearity)
+- Missing values: None across columns.
+- Integrity checks: Derived `deltaOrig`, `deltaDest`; created `orig_mismatch`, `dest_mismatch` flags from balance consistency.
+- Outliers: Clipped 0.5% tails for numeric stability.
+- Multicollinearity: Correlation screen removed redundant numeric features; dropped high-cardinality IDs (`nameOrig`, `nameDest`).
+- Note: SHAP shows very high impact for `step`. That can reflect temporal drift. For deployment, prefer a time-based split and monitor `step`-related drift.
+
+### 2) Fraud detection model
+- Models: Class-weighted Logistic Regression (interpretable) and HistGradientBoosting (primary).
+- Imbalance: Kept all positives, capped negatives; also used class_weight='balanced'.
+- Threshold: Tuned on validation via F2 to bias toward recall.
+- Explainability: SHAP global summary + local waterfall for both models (model-agnostic Explainer for HGB, LinearExplainer for LR).
+
+### 3) Variable selection
+- Started with domain features and integrity-derived signals; pruned highly correlated features and IDs.
+- SHAP confirms the main drivers: `step`, `newbalanceOrig`, `orig_mismatch`, `type_CASH_OUT`, `amount_to_origbal`, `oldbalanceOrg`, `amount`, `type_PAYMENT`, `oldbalanceDest`, `newbalanceDest`, `type_TRANSFER`, `deltaDest`, `deltaOrig`, `amount_to_destbal`.
+- Low-impact features (e.g., merchant flags) can be retained for robustness but are not critical.
+
+### 4) Performance demonstration
+- Logistic Regression: ROC-AUC ≈ 0.991, PR-AUC ≈ 0.975; strong but below HGB.
+- HistGradientBoosting: ROC-AUC ≈ 0.9999, PR-AUC ≈ 0.9993; near-perfect on this sample.
+- Reported confusion matrices, classification reports, ROC/PR curves; threshold chosen by F2.
+- SHAP plots provide global (summary) and local (waterfall) interpretability for decisions.
+
+### 5) Key factors predicting fraud (from SHAP)
+- Most influential: `step` (late steps increase risk), `newbalanceOrig`, `orig_mismatch` (inconsistency), `type_CASH_OUT`, `amount_to_origbal` (large amount vs balance), `oldbalanceOrg`, `amount`, `type_PAYMENT` (generally protective), `oldbalanceDest`, `newbalanceDest`, `type_TRANSFER`, and balance deltas.
+- Local SHAP explanations of top-risk cases show the same signals pushing predictions toward fraud.
+
+### 6) Do these factors make sense?
+- Yes for transaction mechanics: TRANSFER → CASH_OUT, large amounts relative to balance, and balance inconsistencies match the data dictionary’s fraud narrative.
+- Caution on `step`: Its dominance suggests temporal clustering of fraud. That’s realistic in simulations but can cause over-optimism if you random-split; prefer time-based validation and monitor `step` drift.
+
+### 7) Prevention recommendations (actionable)
+- Rules and holds: Step-up auth/holds for TRANSFER/CASH_OUT with high `amount_to_origbal` or mismatch flags.
+- Payment controls: Tighter scrutiny on first-time recipients and large cash-outs; cooling-off windows.
+- Risk scoring: Velocity features per origin/destination; device/IP reputation; merchant trust signals.
+- Strong auth: MFA/behavioral checks for high-risk transactions.
+- Monitoring: Hybrid rules + model, online drift detection (especially for `step` and amount ratios), regular retraining.
+
+### 8) How to determine if actions work
+- Rollout: A/B or phased.
+- KPIs: Fraud loss reduction, recall at fixed alert volume, false positive rate, manual review load, user friction.
+- Model health: Track PR-AUC/ROC-AUC and population/feature drift; monitor SHAP importance stability (e.g., watch if `step` importance spikes or flips); recalibrate threshold and retrain on drift.
+
+
+SHAP result findings:
+
+  | Rank | Feature                    | SHAP Impact (Relative) | Business Interpretation                                                                                                     |
+| ---- | -------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| 1    | `step`                     | Very High              | Certain transaction time windows (later steps in simulation) have concentrated fraud events — could indicate batch attacks. |
+| 2    | `newbalanceOrig`           | Very High              | Low remaining balance after transaction often signals account draining.                                                     |
+| 3    | `orig_mismatch`            | High                   | Mismatch between expected and actual origin balance change suggests manipulation or fraud.                                  |
+| 4    | `type_CASH_OUT`            | High                   | Fraudsters often use cash-out transactions to liquidate stolen funds.                                                       |
+| 5    | `amount_to_origbal`        | High                   | Large proportion of the original balance being transferred indicates higher fraud risk.                                     |
+| 6    | `oldbalanceOrg`            | Medium-High            | Specific starting balances are linked to suspicious activity patterns.                                                      |
+| 7    | `amount`                   | Medium-High            | Large absolute transaction amounts can trigger fraud suspicion.                                                             |
+| 8    | `type_PAYMENT`             | Medium                 | Certain payment transactions can be part of fraud patterns.                                                                 |
+| 9    | `oldbalanceDest`           | Medium                 | Destination account balances before transactions may indicate mule accounts.                                                |
+| 10   | `newbalanceDest`           | Medium                 | Large increases in destination balance could be receiving fraudulent transfers.                                             |
+| 11   | `type_TRANSFER`            | Medium                 | Transfers are a common channel for fraud movement.                                                                          |
+| 12   | `deltaDest`                | Low-Medium             | Unusual changes in destination balance outside expected amounts.                                                            |
+| 13   | `deltaOrig`                | Low-Medium             | Irregular changes in origin account balance outside expected amounts.                                                       |
+| 14   | `amount_to_destbal`        | Low                    | Ratio of amount to destination balance — can indicate mule or dormant account.                                              |
+| 15   | `orig_balance_before_zero` | Low                    | Fraudsters may operate from zero-balance accounts for quick transactions.                                                   |
+| 16   | `dest_mismatch`            | Low                    | Mismatches in destination balances hint at manipulation.                                                                    |
+| 17   | `dest_balance_before_zero` | Low                    | Destination account had zero balance before transaction — common mule pattern.                                              |
+| 18   | `type_DEBIT`               | Very Low               | Some debit transactions may be linked to fraud, but low overall impact here.                                                |
+| 19   | `orig_is_merchant`         | Very Low               | Merchant-origin transactions have little fraud influence in this dataset.                                                   |
+| 20   | `dest_is_merchant`         | Very Low               | Merchant destination transactions have low correlation to fraud in this dataset.                                            |
+
+
+
+
+Basic working:
+
+### Cell 0 — Quick scan of the raw CSV (shape, nulls, dtypes)
+- What it does:
+  - Streams `Fraud.csv` in chunks (`CHUNK = 200_000`) to compute total rows, per-column null counts, and sample distinct values; records inferred dtypes.
+- Why it matters:
+  - Confirms dataset scale and that there are no missing values.
+  - Guides downstream parsing and memory-conscious design (streaming, not loading all 6.36M rows at once).
+
+### Cell 1 — Setup: imports and configuration
+- What it does:
+  - Imports core libs: `numpy`, `pandas`, plotting (`matplotlib`, `seaborn`), scikit-learn utilities and metrics.
+  - Sets a reproducible `RANDOM_SEED`, basic plotting defaults, and asserts the CSV exists.
+- Why it matters:
+  - Centralizes configuration.
+  - Ensures the environment is ready for consistent experiments and visuals.
+
+### Cell 3 — Class-aware sampling helper `load_sampled_df(...)`
+- What it does:
+  - First pass: counts positives/negatives to gauge imbalance.
+  - Second pass: keeps all frauds (`isFraud == 1`) and caps non-frauds by a quota (`majority_cap` or `minority_multiplier * total_pos`), then concatenates the result.
+- Why it matters:
+  - The original data is extremely imbalanced; this sampling provides a tractable, still representative dataset for modeling and iteration without exhausting memory or compute.
+  - Maintains all positive cases, which are scarce and critical for learning.
+
+### Cell 4 — Missing-value check
+- What it does:
+  - Calls `sample_df.isna().sum()` and displays counts.
+- Why it matters:
+  - Validates the data dictionary claim of no missingness; protects later stages (feature engineering and model training) from NaN-induced failures.
+
+### Cell 5 — Balance integrity checks `check_balance_integrity(...)`
+- What it does:
+  - Creates `deltaOrig = oldbalanceOrg - newbalanceOrig` and `deltaDest = newbalanceDest - oldbalanceDest`.
+  - Builds `orig_matches` and `dest_matches` flags based on the expected accounting identity by `type` (e.g., for `TRANSFER` and `CASH_OUT`, `deltaOrig ≈ amount`).
+- Why it matters:
+  - Encodes domain logic into features that capture inconsistent balances, which often indicate fraud or anomalous behavior.
+  - These become powerful predictive signals (`orig_mismatch`, `dest_mismatch` later).
+
+### Cell 6 — Outlier exploration and clipping
+- What it does:
+  - Plots histograms/boxplots for numeric columns to visualize distributions.
+  - Clips the extreme 0.5% tails of numeric variables using percentile-based `np.clip`.
+- Why it matters:
+  - Reduces the impact of extreme values on model stability, especially for linear models and distance-based metrics.
+  - Keeps the distribution shape while containing extreme leverage points.
+
+### Cell 7 — Feature engineering and multicollinearity filtering
+- What it does:
+  - One-hot encodes `type` into `type_*` features.
+  - Adds merchant flags (`dest_is_merchant`, `orig_is_merchant`) based on `M`-prefix convention.
+  - Creates ratio features: `amount_to_origbal`, `amount_to_destbal`; zero-balance flags.
+  - Converts balance-consistency booleans into mismatch indicators: `orig_mismatch`, `dest_mismatch`.
+  - Drops obvious leakage/high-cardinality IDs: `nameOrig`, `nameDest`.
+  - Correlation screen among numeric features; removes one of any pair with |r| > 0.98 to form `selected_features`.
+- Why it matters:
+  - Transforms raw ledger data into behaviorally meaningful signals the model can learn from.
+  - Reduces redundancy to avoid unstable coefficients and overfitting, especially important for logistic regression and interpretability.
+
+### Cell 8 — Train/test split and class weights
+- What it does:
+  - Forms `X` from `selected_features`, `y = isFraud`.
+  - Stratified split to preserve class ratio; 25% test set.
+  - Computes `class_weight_dict` via `compute_class_weight('balanced', ...)` for the training labels.
+- Why it matters:
+  - Ensures evaluation on unseen data that reflects class imbalance.
+  - Class weights counteract residual imbalance during training, improving recall on the minority class.
+
+### Cell 9 — Model training: Logistic Regression and HistGradientBoosting
+- What it does:
+  - Trains `LogisticRegression` with class weights and higher `max_iter`.
+  - Trains `HistGradientBoostingClassifier` (strong tabular learner) with reasonable defaults.
+- Why it matters:
+  - Provides both an interpretable baseline (LR) and a high-performing non-linear model (HGB) to compare trade-offs between accuracy and explainability.
+
+### Cell 10 — Evaluation utility and metrics
+- What it does:
+  - `evaluate_model(...)` computes train/test ROC-AUC and PR-AUC using probabilities.
+  - Selects a decision threshold that maximizes F2 on the test predictions (weights recall higher than precision).
+  - Prints confusion matrix and `classification_report`.
+  - Plots ROC and Precision-Recall curves.
+- Why it matters:
+  - PR-AUC is critical for imbalanced classification; threshold tuning via F2 aligns with fraud detection priorities (missing frauds is expensive).
+  - Curves visualize trade-offs and potential overfitting (train vs test gaps).
+
+### Cell 11 — Feature importance (global) without SHAP
+- What it does:
+  - For LR, shows signed coefficients (direction and magnitude) by feature.
+  - For HGB, uses permutation importance on the test set to estimate impact.
+- Why it matters:
+  - Offers model-specific interpretability: LR coefficients are directionally intuitive; permutation importance is model-agnostic and robust for tree models.
+
+### Cell 12 — SHAP analysis (global + local explanations)
+- What it does:
+  - Attempts to import `shap` and initializes plotting.
+  - Samples a small `background` set from `X_train` and a larger `X_te_sample` for evaluation.
+  - Builds an explainer for HGB using `hgb.predict_proba` (class 1) and computes SHAP values.
+  - Displays a SHAP summary plot (global) and a local waterfall for the highest-risk prediction.
+  - For LR, uses `shap.LinearExplainer` and a SHAP summary plot as well.
+  - Includes robust handling for SHAP array shapes and numeric coercion to avoid plotting/type errors.
+- Why it matters:
+  - SHAP provides consistent, local explanations of individual predictions and an aggregate view of global feature importance.
+  - Validates that the most influential signals align with domain intuition and non-SHAP importances.
+
+### Cells 13 & 14 — Narrative answers and recommendations
+- What they do:
+  - Document the full pipeline, results, and SHAP-driven insights.
+  - Provide operational recommendations for prevention and how to measure impact post-deployment.
+- Why it matters:
+  - Bridges the technical analysis to business actions and governance: thresholds, rollout strategy, and monitoring.
+
+### How these blocks fit together
+- Data scan and sampling ensure a manageable, representative dataset.
+- Cleaning and integrity checks convert raw ledger behavior into fraud signals.
+- Outlier clipping and multicollinearity filtering stabilize learning.
+- Feature engineering translates transaction semantics into model-ready inputs.
+- Split + class weights + evaluation align the training objective with the real-world cost of false negatives.
+- Dual-model training gives both interpretability and top performance.
+- SHAP closes the loop with transparent, trustworthy explanations for stakeholders and auditors.
+- Final narrative contextualizes results and turns them into deployable policy and monitoring steps.
